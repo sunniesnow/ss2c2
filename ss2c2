@@ -1,0 +1,164 @@
+#!/usr/bin/env ruby
+
+require 'json'
+require 'optparse'
+
+options = {}
+OptionParser.new do |parser|
+	parser.banner = "Usage: #{__FILE__} [input] [output] [options]"
+
+	parser.on "-h", "--help", "Prints this help" do
+		puts parser
+		exit
+	end
+end.parse!
+
+input_file = ARGV[0] || '/dev/stdin'
+output_file = ARGV[1] || '/dev/stdout'
+input_chart = JSON.parse File.read input_file
+input_events = input_chart['events']
+input_events.each { |event| event['tick'] = (event['time'] * 1000).round }
+input_notes = input_events.filter { |event| %w[tap drag hold flick].include? event['type'] }
+input_notes.sort_by! { |event| event['tick'] }
+
+event_order_list = []
+tempo_list = []
+note_list = []
+page_list = []
+
+# Group notes by their y position.
+# Discard notes if more than two distinc y positions are present.
+# Returns an array of at most length 2, with each element being an array of notes with the same y position.
+# The input array will be modified (with elements deleted and reordered).
+def organize_simutaneous_notes notes, last_y = 0
+	notes.sort_by! { |note| (note['properties']['y'] - last_y).abs }
+	notes_grouped_by_y = notes.group_by { |note| note['properties']['y'] }
+	if notes_grouped_by_y.size > 2
+		warn "Warning: Some notes are discarded."
+		notes_grouped_by_y.slice! ..2
+		notes.replace notes_grouped_by_y.inject([]) { _1 + _2 }
+	end
+	notes_grouped_by_y.values
+end
+
+# Handle the first page and the first notes
+input_notes_grouped_by_tick = input_notes.group_by { |event| event['tick'] }
+notes = input_notes_grouped_by_tick.values.first
+notes_grouped_by_y = organize_simutaneous_notes notes
+page_list.push({
+	start_tick: 0,
+	end_tick: notes.first['tick'],
+	scan_line_direction: notes.first['properties']['y'] >= 0 ? 1 : -1,
+	PositionFunction: {Type: 0, Arguments: [0.0, notes.first['properties']['y'] / 50.0]}
+})
+notes_grouped_by_y.each_with_index do |notes_with_same_y, i|
+	notes_with_same_y.each do |note|
+		note_list.push(note['out'] = {
+			page_index: i,
+			type: {tap: 0, hold: 2, drag: 3, flick: 5}[note['type'].to_sym], # change later
+			id: note_list.length,
+			tick: note['tick'],
+			x: (note['properties']['x'] + 100) / 200.0,
+			has_sibling: notes.length > 1,
+			hold_tick: note['type'] == 'hold' ? (note['properties']['duration'] * 1000).round : 0,
+			next_id: note['type'] == 'drag' ? -1 : 0, # change later
+			is_forward: false,
+			NoteDirection: 0
+		})
+	end
+end
+
+input_notes_grouped_by_tick.each_cons 2 do |(last_tick, last_notes), (tick, notes)|
+	notes_grouped_by_y = organize_simutaneous_notes notes, last_notes.last['properties']['y']
+
+	# Add page
+	y1 = last_notes.last['properties']['y']
+	y2 = notes.first['properties']['y']
+	page_list.push({
+		start_tick: last_tick,
+		end_tick: tick,
+		scan_line_direction: y2 - y1 >= 0 ? 1 : -1, # 1 up, -1 down
+		PositionFunction: {
+			Type: 0,
+			# 1st arg: amplitude, 1.0 for full height
+			# 2nd arg: center position, -1.0 for bottom, 1.0 for top
+			Arguments: [(y2 - y1).abs / 100.0, (y2 + y1) / 100.0]
+		}
+	})
+
+	# Add notes
+	notes_grouped_by_y.each_with_index do |notes_with_same_y, i|
+		notes_with_same_y.each do |note|
+			note_list.push(note['out'] = {
+				page_index: page_list.length - 1 + i,
+				type: {tap: 0, hold: 2, drag: 3, flick: 5}[note['type'].to_sym], # change later
+				id: note_list.length,
+				tick: tick,
+				x: (note['properties']['x'] + 100) / 200.0,
+				has_sibling: notes.length > 1,
+				hold_tick: note['type'] == 'hold' ? (note['properties']['duration'] * 1000).round : 0,
+				next_id: note['type'] == 'drag' ? -1 : 0, # change later
+				is_forward: false,
+				NoteDirection: 0
+			})
+		end
+	end
+end
+
+# Handle the last page
+note = input_notes_grouped_by_tick.values.last.last
+page_list.push({
+	start_tick: note['tick'],
+	end_tick: note['tick'] + 1,
+	scan_line_direction: 1,
+	PositionFunction: {
+		Type: 0,
+		Arguments: [0.0, note['properties']['y'] / 50.0]
+	}
+})
+
+# Connect chains
+input_notes.group_by { |note| note['properties']['tipPoint'] }.each do |tip_point_id, notes|
+	next unless tip_point_id
+	notes.each_cons 2 do |note1, note2|
+		type1 = note1['type']
+		output_note1 = note1['out']
+		output_note2 = note2['out']
+		type2 = note2['type']
+		if type1 == 'tap' && type2 == 'drag'
+			output_note1[:next_id] = output_note2[:id]
+			output_note1[:type] = 6 # click drag
+			output_note2[:type] = 7 # click drag child
+		elsif output_note1[:type] == 7 && type2 == 'drag'
+			output_note1[:next_id] = output_note2[:id]
+			output_note2[:type] = 7 # click drag child
+		elsif [3, 4].include?(output_note1[:type]) && type2 == 'drag'
+			output_note1[:next_id] = output_note2[:id]
+			output_note2[:type] = 4 # drag child
+		end
+	end
+end
+
+# Big texts
+input_events.each do |event|
+	next if event['type'] != 'bigText'
+	event_order_list.push({
+		tick: event['tick'],
+		event_list: [{
+			type: 8, # custom texts
+			args: "#{event['properties']['text'].tr ?,, ?\s},#FFFFFF" # white text, cannot contain comma
+		}]
+	})
+end
+
+File.write output_file, JSON.generate({
+	format_version: 1,
+	time_base: 480,
+	start_offset_time: 0.0,
+	end_offset_time: 0.0,
+	is_start_without_ui: false,
+	page_list: page_list,
+	tempo_list: [{tick: 0, value: 480000}], # one millisecond per tick
+	event_order_list: event_order_list,
+	note_list: note_list
+})
