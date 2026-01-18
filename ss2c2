@@ -3,7 +3,28 @@
 require 'json'
 require 'optparse'
 
-options = {}
+begin
+	require 'tqdm'
+rescue LoadError
+	module Enumerable
+		def tqdm(...)
+			self
+		end
+	end
+end
+
+$options = {
+	preparation_time: 1.0,
+	first_page_time: 1.0,
+	last_page_time: 1.0,
+	rasterization_y: 0.01,
+	rasterization_time: nil,
+	time_base: 480,
+	hold_end_tolerance: 0.001,
+	max_tick_time: 0.01,
+	approach_rate: 1.0,
+	drop_rate: 0.1,
+}
 OptionParser.new do |parser|
 	parser.banner = "Usage: #{__FILE__} [input] [output] [options]"
 
@@ -11,154 +32,881 @@ OptionParser.new do |parser|
 		puts parser
 		exit
 	end
+
+	parser.on "--preparation-time TIME", Float, "Preparation time before the first page (default: #{$options[:preparation_time]} s)" do |v|
+		$options[:preparation_time] = v
+	end
+
+	parser.on "--first-page-time TIME", Float, "Time allocated for the first page (default: #{$options[:first_page_time]} s)" do |v|
+		$options[:first_page_time] = v
+	end
+
+	parser.on "--last-page-time TIME", Float, "Time allocated for the last page (default: #{$options[:last_page_time]} s)" do |v|
+		$options[:last_page_time] = v
+	end
+
+	parser.on "--rasterization-y VALUE", Float, "Rasterization unit for y coordinate (default: #{$options[:rasterization_y]})" do |v|
+		$options[:rasterization_y] = v
+	end
+
+	parser.on "--rasterization-time VALUE", Float, "Rasterization unit for time coordinate (default: do not rasterize)" do |v|
+		$options[:rasterization_time] = v
+	end
+
+	parser.on "--time-base VALUE", Integer, "Time base for tick calculation (default: #{$options[:time_base]})" do |v|
+		$options[:time_base] = v
+	end
+
+	parser.on "--hold-end-tolerance VALUE", Float, "Tolerance for error in hold end time (default: #{$options[:hold_end_tolerance]} s)" do |v|
+		$options[:hold_end_tolerance] = v
+	end
+
+	parser.on "--max-tick-time", Float, "Allowed maximum duration of a tick (default: #{$options[:max_tick_time]} s)" do |v|
+		$options[:max_tick_time] = v
+	end
+
+	parser.on "--approach-rate VALUE", Float, "Approach rate in second^-1 (default: #{$options[:approach_rate]} s^-1)" do |v|
+		$options[:approach_rate] = v
+	end
+
+	parser.on "--drop-rate VALUE", Float, "Drop rate in second^-1 (default: #{$options[:drop_rate]} s^-1)" do |v|
+		$options[:drop_rate] = v
+	end
 end.parse!
+
+class Note
+	attr_reader :x, :y, :type, :duration, :tip_point
+	attr_accessor :time, :page, :tick, :end_tick, :id, :has_sibling, :drop_direction, :is_click_drag, :previous_note, :next_note
+
+	def initialize event
+		@time = event[:time].to_f
+		@time = (@time / $options[:rasterization_time]).round * $options[:rasterization_time] if $options[:rasterization_time]
+		@type = event[:type].to_sym
+		@duration = event[:properties][:duration]&.to_f || 0.0
+		@duration = (@duration / $options[:rasterization_time]).round * $options[:rasterization_time] if $options[:rasterization_time]
+		@duration = @duration.clamp($options[:hold_end_tolerance]..) if @type == :hold
+		@tip_point = event[:properties][:tipPoint]
+		@x = event[:properties][:x].to_f
+		@y = event[:properties][:y].to_f
+		# do not want notes very close in y to be regarded as different y
+		# because monotinicity in y affects notes grouping
+		@y = (@y / $options[:rasterization_y]).round.to_f
+		@y = Page.clamp @y # clamp because Cytus II does not allow out of bounds
+	end
+
+	include Comparable
+	def <=> other
+		@time <=> other.time
+	end
+
+	# debugging purpose
+	def to_s
+		"(#@time:#@y)"
+	end
+
+	# I am supposed to use the formula here, but this formula does not seem correct as I tested in Cylheim:
+	# https://sites.google.com/site/cytoidcommunity/charting/excel-charting#h.p_OJoCCIHP4iaQ
+	def approach_rate
+		page_ratio = @page.scan_line_direction.zero? ? (@time - @page.start_time) / @page.length : (@y - @page.start_y) / (@page.end_y - @page.start_y)
+		[page.length * page_ratio + (page.previous_page&.length || $preparation_time) * (1.367 - page_ratio), 1.367].min * $options[:approach_rate]
+	end
+
+	def to_cytus
+		type = case @type
+		when :tap
+			@page.scan_line_direction == 0 && @drop_direction ? 8 : @is_click_drag ? 6 : 0
+		when :hold
+			@time + @duration <= @page.end_time ? 1 : 2
+		when :drag
+			@page.scan_line_direction == 0 && @drop_direction ? 9 : @is_click_drag ? 7 : @previous_note ? 4 : 3
+		when :flick
+			5
+		end
+		{
+			page_index: @page.id,
+			type: type,
+			id: @id,
+			tick: @tick,
+			x: (@x + 100.0) / 200.0,
+			has_sibling: @has_sibling,
+			hold_tick: @end_tick - @tick,
+			next_id: [3, 4, 6, 7].include?(type) ? @next_note&.id || -1 : 0,
+			is_forward: false,
+			NoteDirection: @drop_direction || 0,
+			approach_rate: approach_rate,
+		}
+	end
+
+	def self.notes_from_events events
+		note_from_event = {}
+		notes = events.filter_map { note_from_event[_1] = Note.new _1 if %w[tap drag hold flick].include? _1[:type] }
+		events.group_by { _1[:properties][:tipPoint] }.each do |tip_point_id, events_with_same_tip_point|
+			next if tip_point_id.nil?
+			if events_with_same_tip_point.size == 2
+				placeholder = events_with_same_tip_point.find { _1[:type] == 'placeholder' }
+				note = events_with_same_tip_point.find { %w[drag tap].include? _1[:type] }
+				if placeholder && note && placeholder[:time] < note[:time] && placeholder[:properties][:x] == note[:properties][:x] && placeholder[:properties][:y] != note[:properties][:y]
+					note_from_event[note].drop_direction = placeholder[:properties][:y] > note[:properties][:y] ? 0 : 1
+				end
+			end
+			events_with_same_tip_point.reject { _1[:type] == 'placeholder' }.sort_by { _1[:time] }.each_cons 2 do |event1, event2|
+				note1 = note_from_event[event1]
+				note2 = note_from_event[event2]
+				next unless note1 && note2
+				if note1.type == :tap && note2.type == :drag
+					note1.is_click_drag = true
+					note2.is_click_drag = true
+					note1.next_note = note2
+					note2.previous_note = note1
+				elsif note1.is_click_drag && note2.type == :drag
+					note2.is_click_drag = true
+					note1.next_note = note2
+					note2.previous_note = note1
+				elsif note1.type == :drag && note2.type == :drag
+					note1.next_note = note2
+					note2.previous_note = note1
+				end
+			end
+		end
+		notes
+	end
+end
+
+class NotesOfEqualTime
+	attr_reader :time, :notes, :notes_of_equal_y
+	def initialize time, notes
+		@time = time
+		@notes = notes
+		@notes_of_equal_y = group_by_y
+		@notes.each { _1.has_sibling = @notes.size > 1 }
+	end
+
+	def group_by_y
+		result = @notes.group_by(&:y).map { NotesOfEqualY.new @time, _1, _2 }
+		if result.size > 2
+			warn "Warning: Some notes are discarded at time #{@time}."
+			result.slice! ...2
+			@notes.replace result.inject([]) { _1 + _2.notes }
+		end
+		result
+	end
+
+	include Comparable
+	def <=> other
+		@time <=> other.time
+	end
+
+	def double?
+		@notes_of_equal_y.size == 2
+	end
+end
+
+class NotesOfEqualY
+	attr_accessor :time
+	attr_reader :y, :notes
+	def initialize time, y, notes
+		@time = time
+		@y = y
+		@notes = notes
+	end
+end
+
+class Page
+	attr_reader :notes_of_equal_y, :notes, :monotonicity, :tick_from_time, :exact_end_time, :end_tick
+	attr_accessor :start_time, :end_time, :previous_page, :next_page, :start_y, :end_y, :start_tick, :exact_start_time, :id
+
+	def initialize start_time, end_time, notes_of_equal_y
+		@start_time = start_time
+		@end_time = end_time
+		@notes_of_equal_y = notes_of_equal_y
+		@notes = notes_of_equal_y.flat_map &:notes
+		@timings = Set.new # timing points that require integer ticks within the page other than the notes themselves
+		@monotonicity = @notes_of_equal_y.length == 1 ? nil : @notes_of_equal_y.last.y <=> @notes_of_equal_y.first.y
+	end
+
+	def length
+		@end_time - @start_time
+	end
+
+	# debugging purpose
+	def to_s
+		"#@start_time:[#{@notes.join ' '}]:#@end_time"
+	end
+
+	def add_timing time
+		@timings.add time
+	end
+
+	def extrapolated_start_y
+		return nil unless @monotonicity
+		slope = (@notes_of_equal_y[1].y - @notes_of_equal_y[0].y) / (@notes_of_equal_y[1].time - @notes_of_equal_y[0].time)
+		(@notes_of_equal_y[0].y - slope * (@notes_of_equal_y[0].time - @start_time)).round.to_f
+	end
+
+	def extrapolated_end_y
+		return nil unless @monotonicity
+		slope = (@notes_of_equal_y[-1].y - @notes_of_equal_y[-2].y) / (@notes_of_equal_y[-1].time - @notes_of_equal_y[-2].time)
+		(@notes_of_equal_y[-1].y + slope * (@end_time - @notes_of_equal_y[-1].time)).round.to_f
+	end
+
+	# this is the actual moving direction of the scan line of this page.
+	# different from @monotonicity, it cannot be nil.
+	# when it is nonzero, it is the same as the scan_line_direction field put in the Cytus II chart.
+	def scan_line_direction
+		return @scan_line_direction if @scan_line_direction # cache
+		return @scan_line_direction = @monotonicity if @monotonicity
+		y = @notes_of_equal_y.first.y
+		direction1 = y <=> @previous_page.extrapolated_end_y if @previous_page&.notes_of_equal_y&.last&.time&.!= @start_time
+		direction2 = @next_page.extrapolated_start_y <=> y if @next_page&.notes_of_equal_y&.first&.time&.!= @end_time
+		@scan_line_direction = if direction1 && direction2 && direction1 + direction2 != 0 # [1,1], [1,0], [0,1], [-1,-1], [-1,0], [0,-1]
+			direction1 + direction2 <=> 0
+		elsif direction1 == 0 || direction2 == 0 # [0,0], [0,nil], [nil,0]
+			0
+		elsif direction1 && direction2 # [1,-1], [-1,1]
+			direction1
+		elsif !direction1 && !direction2 # [nil,nil]
+			# this can only happen if one of @previous_page and @next_page is nil
+			(@previous_page ? -1 : 1) * (y >= 0 ? 1 : -1)
+		else # [1,nil], [-1,nil], [nil,1], [nil,-1]
+			direction1 || direction2
+		end
+	end
+
+	# this is the scan_line_direction field put in the Cytus II chart.
+	# when scan_line_direction is zero, we need to determine either 1 or -1 to put in the chart.
+	# it controls the color of the notes, so it is not arbitrary.
+	# we try to make the colors alternate between pages.
+	def actual_scan_line_direction
+		return @actual_scan_line_direction if @actual_scan_line_direction
+		return @actual_scan_line_direction = scan_line_direction if scan_line_direction.nonzero?
+		# scan_line_direction == 0
+		return @actual_scan_line_direction = -@previous_page.actual_scan_line_direction if @previous_page
+		# this is the first page
+		page = self
+		sign = -1
+		while page = page.next_page
+			return @actual_scan_line_direction = sign * page.scan_line_direction if page.scan_line_direction.nonzero?
+			sign = -sign
+		end
+		@actual_scan_line_direction = @notes_of_equal_y.first.y >= 0 ? 1 : -1 # now it is truly arbitrary
+	end
+
+	# set @exact_start_time and @start_tick before calling this method,
+	# and then @end_tick, @exact_end_time, and @tick_from_time will be set after calling this method.
+	# @exact_start_time is slightly different from @start_time * time_base * 1e6 due to rounding errors.
+	# @exact_start_time is an integer to avoid any rounding errors.
+	def tempo_list
+		return @tempo_list if @tempo_list
+		reverse_search = {}
+		timings = @notes_of_equal_y.map { reverse_search[_1.time] = {time: _1.time, y: _1.y} }
+		timings.unshift({time: @start_time, y: @start_y}) if @start_time != timings.first[:time]
+		timings.push({time: @end_time, y: @end_y}) if @end_time != timings.last[:time]
+		extra_timings = @timings.filter_map do |time|
+			index = timings.bsearch_index { _1[:time] >= time }
+			if timings[index][:time] - time < $options[:hold_end_tolerance]
+				reverse_search[time] = timings[index]
+				next
+			end
+			if time - timings[index - 1][:time] < $options[:hold_end_tolerance]
+				reverse_search[time] = timings[index - 1]
+				next
+			end
+			reverse_search[time] = {time: time, index: index}
+		end
+		if scan_line_direction.nonzero?
+			# sometimes sub-rasterization positions are required to contain extra timings
+			double = extra_timings.any? do |timing|
+				(timings[timing[:index]][:y] - timings[timing[:index] - 1][:y]).abs < 2
+			end
+			dy = double ? 0.5 : 1.0
+			extra_timings.each do |timing|
+				t = timing[:time]
+				y1, time1 = timings[timing[:index] - 1].values_at :y, :time
+				y2, time2 = timings[timing[:index]].values_at :y, :time
+				slope = (y2 - y1) / (time2 - time1)
+				y = ((y1 + slope * (t - time1)) / dy).round * dy
+				y += scan_line_direction * dy if (y - y1).abs < dy
+				y -= scan_line_direction * dy if (y - y2).abs < dy
+				timing[:y] = y
+			end
+			timings.concat extra_timings
+			timings.sort_by! { _1[:time] }
+			timings.first[:exact_time] = @exact_start_time
+			timings.first[:tick] = @start_tick
+			largest_tick_time = timings.each_cons(2).map do |timing1, timing2|
+				(timing2[:time] - timing1[:time]) / ((timing2[:y] - timing1[:y]).abs / dy).round
+			end.max
+			dy /= (largest_tick_time / $options[:max_tick_time]).ceil
+			timings.each_cons 2 do |timing1, timing2|
+				delta_tick = ((timing2[:y] - timing1[:y]).abs / dy).round
+				timing1[:tempo] = ((timing2[:time] * 1e6 * $options[:time_base] - timing1[:exact_time]) / delta_tick).round
+				timing2[:exact_time] = timing1[:exact_time] + timing1[:tempo] * delta_tick
+				timing2[:tick] = timing1[:tick] + delta_tick
+			end
+		else
+			timings.concat extra_timings
+			timings.sort_by! { _1[:time] }
+			timings.first[:exact_time] = @exact_start_time
+			timings.first[:tick] = @start_tick
+			timings.each_cons 2 do |timing1, timing2|
+				delta_tick = ((timing2[:time] - timing1[:time]) / $options[:max_tick_time] / length / $options[:drop_rate]).ceil
+				timing1[:tempo] = ((timing2[:time] * 1e6 * $options[:time_base] - timing1[:exact_time]) / delta_tick).round
+				timing2[:exact_time] = timing1[:exact_time] + timing1[:tempo] * delta_tick
+				timing2[:tick] = timing1[:tick] + delta_tick
+			end
+		end
+		@tick_from_time = reverse_search.transform_values { _1[:tick] }
+		@end_tick = timings.last[:tick]
+		@exact_end_time = timings.last[:exact_time]
+		@tempo_list = timings[...-1].map { {tick: _1[:tick], value: _1[:tempo]} }
+	end
+
+	def self.clamp y
+		y.clamp -(50.0/$options[:rasterization_y]).round.to_f, (50.0/$options[:rasterization_y]).round.to_f
+	end
+
+	# determine page1.end_y and page2.start_y
+	def self.boundary_positions page1, page2
+		last_y = page1.notes_of_equal_y.last.y
+		last_time = page1.notes_of_equal_y.last.time
+		first_y = page2.notes_of_equal_y.first.y
+		first_time = page2.notes_of_equal_y.first.time
+		time = page1.end_time # which equals page2.start_time
+		end_y = last_y if page1.monotonicity == 0 || last_time == time
+		start_y = first_y if page2.monotonicity == 0 || first_time == time
+		return end_y, start_y if end_y && start_y
+		# from now on, we can assume that the page boundary is not a double note,
+		# and at least one of page1.monotonicity and page2.monotonicity is not nil
+		if end_y # page1 end is determined, only need to consider different cases of page2
+			return end_y, end_y if (first_y <=> end_y) == page2.scan_line_direction
+			if page2.monotonicity.nil? # in this case page1.monotonicity is guaranteed to be not nil
+				# in the implementation of scan_line_direction, when determining page2.scan_line_direction,
+				# if the result from the extrapolated y of its previous page and next page differ,
+				# then it will use its previous page, which is page1 in this case.
+				# therefore, the only case where the execution reaches here is when first_y == end_y.
+				return end_y, first_y - page2.scan_line_direction
+			end
+			# page2.monotonicity is 1 or -1
+			start_y = clamp page2.extrapolated_start_y # is not nil
+			# avoid stationary scan line for strictly monotonic pages
+			start_y -= page2.monotonicity if start_y == first_y
+			return end_y, start_y
+		elsif start_y # page2 start is determined, only need to consider different cases of page1
+			return start_y, start_y if (start_y <=> last_y) == page1.scan_line_direction
+			if page1.monotonicity.nil?
+				# we can use page1.start_y because it should have been determined before this method is called
+				return last_y + page1.scan_line_direction, start_y if last_time == page1.start_time
+				slope = (last_y - page1.start_y) / (last_time - page1.start_time)
+				return (last_y + slope * (time - last_time)).round.to_f, start_y
+			end
+			# page1.monotonicity is 1 or -1
+			end_y = clamp page1.extrapolated_end_y
+			end_y += page1.monotonicity if end_y == last_y
+			return end_y, start_y
+		elsif page1.monotonicity == page2.monotonicity # in this case, both of them are not nil and not zero
+			# interpolation is not an option because otherwise page1 and page2 can be combined to get a better pagination
+			end_y = clamp page1.extrapolated_end_y
+			end_y += page1.monotonicity if end_y == last_y
+			start_y = page2.extrapolated_start_y
+			start_y = clamp start_y
+			start_y -= page2.monotonicity if start_y == first_y
+			return end_y, start_y
+		elsif page1.monotonicity && page2.monotonicity # both of them are not nil and not zero, and different
+			y = clamp ((page1.extrapolated_end_y + page2.extrapolated_start_y) / 2).round.to_f
+			y = last_y + page1.monotonicity if (y <=> last_y) != page1.monotonicity
+			y = first_y - page2.monotonicity if (first_y <=> y) != page2.monotonicity
+			return y, y
+		end
+		# exactly one of page1.monotonicity and page2.monotonicity is nil,
+		# and the other is 1 or -1.
+		# interpolation is not an option because otherwise page1 and page2 can be combined to get a better pagination
+		if page1.monotonicity
+			end_y = clamp page1.extrapolated_end_y
+			end_y += page1.monotonicity if end_y == last_y
+			return end_y, end_y if (first_y <=> end_y) == page2.scan_line_direction
+			# page2.next_page.extrapolated_start_y must exist because otherwise the last condition will be satisfied
+			slope = (page2.next_page.extrapolated_start_y - first_y) / (page2.end_time - first_time)
+			start_y = clamp (first_y - slope * (first_time - time)).round.to_f
+			start_y -= page2.scan_line_direction if start_y == first_y
+			return end_y, start_y
+		else
+			start_y = clamp page2.extrapolated_start_y
+			start_y -= page2.monotonicity if start_y == first_y
+			return start_y, start_y if (start_y <=> last_y) == page1.scan_line_direction
+			# the denominator must be nonzero because otherwise the last condition will be satisifed
+			slope = if last_time == page1.start_time
+				(last_y - page1.previous_page.notes_of_equal_y.last.y) / (last_time - page1.previous_page.notes_of_equal_y.last.time)
+			else
+				(last_y - page1.start_y) / (last_time - page1.start_time)
+			end
+			end_y = clamp (last_y + slope * (time - last_time)).round.to_f
+			end_y += page1.scan_line_direction if end_y == last_y
+			return end_y, start_y
+		end
+	end
+
+	def self.first_boundary_position page
+		first_y = page.notes_of_equal_y.first.y
+		first_time = page.notes_of_equal_y.first.time
+		return first_y if page.start_time == first_time
+		if page.monotonicity
+			start_y = clamp page.extrapolated_start_y
+			start_y -= page.monotonicity if start_y == first_y
+			return start_y
+		end
+		if !page.next_page || page.next_page.notes_of_equal_y.first.time == first_time
+			return clamp -page.scan_line_direction * 100.0 + first_y
+		end
+		# from now on we can assume that page.next_page.monotonicity is not nil
+		next_start_y = clamp page.next_page.extrapolated_start_y
+		slope = (next_start_y - first_y) / (page.end_time - first_time)
+		start_y = clamp (first_y - slope * (first_time - page.start_time)).round.to_f
+		start_y -= page.monotonicity if start_y == first_y
+		start_y
+	end
+
+	def self.last_boundary_position page
+		last_y = page.notes_of_equal_y.last.y
+		last_time = page.notes_of_equal_y.last.time
+		return last_y if page.end_time == last_time
+		if page.monotonicity
+			end_y = clamp page.extrapolated_end_y
+			end_y += page.monotonicity if end_y == last_y
+			return end_y
+		end
+		if page.start_time == last_time
+			return clamp page.scan_line_direction * 100.0 + last_y
+		end
+		# can use page.start_y because it should have been determined before this method is called
+		slope = (last_y - page.start_y) / (last_time - page.start_time)
+		end_y = clamp (last_y + slope * (page.end_time - last_time)).round.to_f
+		end_y += page.monotonicity if end_y == last_y
+		end_y
+	end
+
+	def to_cytus
+		{
+			start_tick: @start_tick,
+			end_tick: @end_tick,
+			scan_line_direction: actual_scan_line_direction,
+			PositionFunction: {
+				Type: 0,
+				Arguments: [
+					(@start_y - @end_y).abs / (100.0 / $options[:rasterization_y]),
+					(@start_y + @end_y) / (100.0 / $options[:rasterization_y])
+				]
+			},
+		}
+	end
+end
+
+class Block
+	attr_reader :notes_of_equal_y, :pages, :sorted_page_lengths
+	def initialize notes_of_equal_y
+		@notes_of_equal_y = notes_of_equal_y
+		@pages = optimal_pagination
+	end
+
+	def optimal_pagination
+		times = @notes_of_equal_y.map &:time
+		earliest_start = BlockSegmentation.find_earliest_start @notes_of_equal_y.map &:y
+		segmentation = BlockSegmentation.find_optimal_segmentation times, earliest_start
+		@sorted_page_lengths = segmentation.lengths_before_pivot
+		segmentation.segment.zip(segmentation.cut).each_cons(2).with_object [] do |((start, start_time), (end_plus_1, end_time)), result|
+			result.push Page.new start_time, end_time, @notes_of_equal_y[start...end_plus_1]
+		end
+	end
+
+	include Comparable
+	def <=> other
+		other = other.sorted_page_lengths if other.respond_to? :sorted_page_lengths
+		@sorted_page_lengths <=> other
+	end
+end
+
+class BlockSequence
+	attr_reader :blocks, :sorted_page_lengths
+	def initialize
+		@blocks = []
+		@sorted_page_lengths = []
+	end
+
+	def add_block! block
+		@blocks.push block
+		@sorted_page_lengths.push *block.sorted_page_lengths
+		@sorted_page_lengths.sort!
+		self
+	end
+
+	def add_block block
+		dup.add_block! block
+	end
+
+	include Comparable
+	def <=> other
+		other = other.sorted_page_lengths if other.respond_to? :sorted_page_lengths
+		@sorted_page_lengths <=> other
+	end
+
+	def initialize_copy other
+		super
+		%i[@blocks @sorted_page_lengths].each do |v|
+			instance_variable_set v, other.instance_variable_get(v).dup
+		end
+	end
+end
+
+class Chart
+	attr_reader :pages
+
+	def initialize notes
+		@notes = notes.sort!
+		@notes_of_equal_time = @notes.group_by(&:time).map { NotesOfEqualTime.new _1, _2 }
+		@blocks = optimal_blocks
+		setup_pages
+		setup_tempo_list
+		setup_notes
+	end
+
+	def setup_pages
+		@pages = @blocks.flat_map &:pages
+		@pages.each_with_index do |page, i|
+			page.id = i + 1 # + 1 because of preparation page
+			page.notes.each { _1.page = page }
+		end
+		first_page = @pages.first
+		last_page = @pages.last
+		@pages.each_cons 2 do |page1, page2|
+			page1.next_page = page2
+			page2.previous_page = page1
+			time = page1.end_time # which equals page2.start_time
+			# I don't know why this is needed, but sometimes due to floating point errors,
+			# time is extremely close but different from page1.notes_of_equal_y.last.time or page2.notes_of_equal_y.first.time
+			# Theoretically because I avoided floating point errors in the taut string algorithm, this should not happen.
+			if time - page1.notes_of_equal_y.last.time < $options[:hold_end_tolerance]
+				page1.end_time = page2.start_time = page1.notes_of_equal_y.last.time
+			elsif page2.notes_of_equal_y.first.time - time < $options[:hold_end_tolerance]
+				page1.end_time = page2.start_time = page2.notes_of_equal_y.first.time
+			end
+		end
+		first_page.start_time = first_page.start_time.clamp(..first_page.end_time - $options[:first_page_time])
+		last_page.end_time = last_page.end_time.clamp(last_page.start_time + $options[:last_page_time]..)
+		if first_page.start_time < $options[:preparation_time]
+			$preparation_time = $options[:preparation_time]
+			shift = $preparation_time - first_page.start_time
+			warn "You need to prepend the audio #{shift} seconds of silence."
+			@pages.each do |page|
+				page.start_time += shift
+				page.end_time += shift
+				page.notes_of_equal_y.each { _1.time += shift }
+				page.notes.each { _1.time += shift }
+			end
+		else
+			$preparation_time = first_page.start_time
+		end
+		@notes.each do |note|
+			next unless note.type == :hold
+			time = note.time + note.duration
+			last_page.end_time = [last_page.end_time, time].max
+			@pages.bsearch { _1.end_time >= time }.add_timing time
+		end
+		first_page.start_y = Page.first_boundary_position first_page
+		@pages.each_cons 2 do |page1, page2|
+			page1.end_y, page2.start_y = Page.boundary_positions page1, page2
+		end
+		last_page.end_y = Page.last_boundary_position last_page
+	end
+
+	def preparation_ticks
+		($preparation_time / $options[:max_tick_time]).ceil
+	end
+	def preparation_tempo
+		($preparation_time * $options[:time_base] * 1e6 / preparation_ticks).round
+	end
+	def preparation_exact_time
+		preparation_ticks * preparation_tempo
+	end
+	def preparation_page_cytus
+		y = @pages.first.start_y
+		{
+			start_tick: 0,
+			end_tick: preparation_ticks,
+			scan_line_direction: y >= 0 ? 1 : -1,
+			PositionFunction: {
+				Type: 0,
+				Arguments: [
+					y.abs / (100.0 / $options[:rasterization_y]) + 0.5,
+					-y / (100.0 / $options[:rasterization_y])
+				]
+			},
+		}
+	end
+
+	def setup_tempo_list
+		@tempo_list = [{tick: 0, value: preparation_tempo}]
+		@pages.reduce [preparation_ticks, preparation_exact_time] do |(current_tick, current_exact_time), page|
+			page.exact_start_time = current_exact_time
+			page.start_tick = current_tick
+			@tempo_list.concat page.tempo_list
+			[page.end_tick, page.exact_end_time]
+		end
+	end
+
+	def setup_notes
+		@notes.each_with_index do |note, i|
+			note.id = i
+			note.tick = note.page.tick_from_time[note.time]
+			end_time = note.time + note.duration
+			note.end_tick = (end_time <= note.page.end_time ? note.page : @pages.bsearch { _1.end_time >= end_time }).tick_from_time[note.time + note.duration]
+		end
+	end
+
+	def to_cytus
+		{
+			format_version: 1,
+			time_base: $options[:time_base],
+			start_offset_time: 0.0,
+			end_offset_time: 0.0,
+			is_start_without_ui: false,
+			page_list: [preparation_page_cytus] + @pages.map(&:to_cytus),
+			tempo_list: @tempo_list,
+			event_order_list: [], # TODO
+			note_list: @notes.map(&:to_cytus),
+		}
+	end
+
+	def optimal_blocks
+		block_boundaries = @notes_of_equal_time.each_with_index.filter_map { _2 if _1.double? }
+		block_boundaries.unshift 0 if block_boundaries.first != 0
+		block_boundaries.push @notes_of_equal_time.length - 1 if block_boundaries.last != @notes_of_equal_time.length - 1
+		result = block_boundaries.each_cons(2).tqdm.reduce @notes_of_equal_time.first.notes_of_equal_y.map { BlockSequence.new } do |best, (block_start, block_end)|
+			@notes_of_equal_time[block_end].notes_of_equal_y.map do |block_end_choice|
+				best.zip(@notes_of_equal_time[block_start].notes_of_equal_y.reverse).map do |block_sequence, block_start_choice|
+					block_sequence.add_block Block.new [
+						block_start_choice,
+						*@notes_of_equal_time[block_start + 1..block_end - 1].map { _1.notes_of_equal_y.first },
+						block_end_choice
+					]
+				end.max
+			end
+		end.max.blocks
+		result.unshift Block.new @notes_of_equal_time.first.notes_of_equal_y - result.first.notes_of_equal_y[..0] if @notes_of_equal_time.first.double?
+		result.push Block.new @notes_of_equal_time.last.notes_of_equal_y - result.last.notes_of_equal_y[-1..] if @notes_of_equal_time.last.double?
+		result
+	end
+
+	# debugging purpose
+	def to_s
+		@pages.join ?\n
+	end
+end
+
+class BlockSegmentation
+
+	attr_reader :segment, :cut, :lengths_before_pivot, :optimal_collections, :nonoptimal
+
+	def initialize times, dp
+		@times = times # @times[i] = time at index i
+		@dp = dp # dynamic programming table: dp[[pivot, cut]] = OptimalBlockSegmentationsAtPivot object
+		@pivot = 0 # segment index of the pivot of the free end of the taut string
+		@max_slope = Float::INFINITY # max slope of the free end of the taut string
+		@min_slope = 0.0 # min slope of the free end of the taut string
+		@segment = [0] # @segment[k] = start index of the kth segment
+		@cut = [@times[0]] # @cut[k] = start time of the kth segment
+		@lengths_before_pivot = [] # lengths of segments before the pivot sorted ascendingly
+		@optimal_collections = Set[] # OptimalBlockSegmentationsAtPivot objects that include this segmentation
+		@nonoptimal = false # mark this for deletion
+		dp_update
+	end
+
+	def next_start
+		@segment.last
+	end
+
+	def max_cut_time i
+		i == @times.length ? @times[i - 1] : @times[i]
+	end
+	def min_cut_time i
+		i == 0 ? @times[0] : @times[i - 1]
+	end
+
+	# updates the pivot to the specified segment and time
+	# the segments after the previous pivot and before the new pivot are linearly interpolated
+	# updates @lengths_before_pivot without sorting it
+	def update_pivot new_pivot, new_cut
+		return if new_pivot == @pivot # happens when setting the final pivot for a block with only one time point
+		segment_length = (new_cut - @cut[@pivot]) / (new_pivot - @pivot)
+		(new_pivot - @pivot).downto 1 do |l| # iterate backward from tail to avoid always resizing arrays
+			@cut[@pivot + l] = segment_length * l + @cut[@pivot]
+			@lengths_before_pivot[@pivot + l - 1] = segment_length
+		end
+		@cut[new_pivot] = new_cut # omittable but keep for floating point precision
+		@pivot = new_pivot
+		# using binary search and insertion would be faster asymptotically
+		# but using corelib sort may be faster in practice for small arrays (not benchmarked)
+		@lengths_before_pivot.sort!
+		dp_update
+	end
+
+	def dp_update
+		key = [@segment[@pivot], @cut[@pivot]]
+		if @dp.key? key
+			@dp[key].update self
+		else
+			@dp[key] = OptimalBlockSegmentationsAtPivot.new self
+		end
+	end
+
+	# update the allowed slope for the free end of the taut string
+	# given currently established pivot and free segments
+	def update_slope_range
+		@max_slope = (@pivot + 1...@segment.length).map { max_slope_at _1 }.min || Float::INFINITY
+		@min_slope = (@pivot + 1...@segment.length).map { min_slope_at _1 }.max || 0.0
+	end
+
+	# the slope range considering the current pivot and the constraint of the cut time at the start of segment k
+	# without considering any other segment
+	def min_slope_at k
+		return 0.0 if k == @pivot
+		(min_cut_time(@segment[k]) - @cut[@pivot]) / (k - @pivot)
+	end
+	def max_slope_at k
+		return Float::INFINITY if k == @pivot
+		(max_cut_time(@segment[k]) - @cut[@pivot]) / (k - @pivot)
+	end
+
+	def add_segment! end_index
+		@segment.push end_index + 1
+		new_max_slope = max_slope_at @segment.length - 1
+		new_min_slope = min_slope_at @segment.length - 1
+
+		# update pivot if necessary; then update slopes
+		if new_max_slope < @min_slope
+			while new_pivot = (@pivot + 1...@segment.length - 1).find { |k| min_slope_at(k) > new_max_slope }
+				update_pivot new_pivot, min_cut_time(@segment[new_pivot])
+				new_max_slope = max_slope_at @segment.length - 1
+			end
+			update_slope_range
+		elsif new_min_slope > @max_slope
+			while new_pivot = (@pivot + 1...@segment.length - 1).find { |k| max_slope_at(k) < new_min_slope }
+				update_pivot new_pivot, max_cut_time(@segment[new_pivot])
+				new_min_slope = min_slope_at @segment.length - 1
+			end
+			update_slope_range
+		else
+			# equivalent to update_slope_range but faster
+			@max_slope = @max_slope.clamp(..new_max_slope)
+			@min_slope = @min_slope.clamp new_min_slope..
+		end
+
+		# set the final pivot if the end is reached
+		update_pivot @segment.length - 1, @times.last if end_index == @times.length - 1
+
+		self
+	rescue WorseBlockSegmentation
+		@nonoptimal = true
+		self
+	end
+
+	def add_segment end_index
+		dup.add_segment! end_index
+	end
+
+	# for deep copy
+	def initialize_copy other
+		super
+		%i[@segment @cut @lengths_before_pivot].each do |v|
+			instance_variable_set v, other.instance_variable_get(v).dup
+		end
+		@optimal_collections = Set[]
+		other.optimal_collections.each { _1.add self }
+	end
+
+	# earliest_start[i] = earliest index to start a new segment ending at index i
+	def self.find_optimal_segmentation times, earliest_start
+		new times, (dp = {})
+		times.length.times do |end_index|
+			# in this case, we can always merge the current segment with the next segment to get a better segmentation
+			next if earliest_start[end_index] == earliest_start[end_index + 2]
+			dp.each_value { _1.purge_unreachable earliest_start[end_index] }
+			dp.each_value.with_object(Set.new) { _2.merge _1.segmentations }.each { _1.add_segment end_index }
+			dp.each_value &:purge_nonoptimal
+		end
+		dp[[times.length, times.last]].segmentations.first.optimize_adjacent_singleton_segments
+	end
+
+	# under the constraint that a segment must be strictly monotonic or constant in y,
+	# find earliest index to start a new segment ending at each index
+	def self.find_earliest_start y
+		y.each_cons(2).with_object [[0, 0, 0]] do |(y1, y2), arr|
+			arr.push [y1 < y2, y1 == y2, y1 > y2].zip(arr.last).map { _1 ? _2 + 1 : 0 }
+		end.map.with_index { _2 - _1.max }
+	end
+
+	# I should not have to do this, but it seems that the taut string algorithm is flawed
+	def optimize_adjacent_singleton_segments
+		i = 0
+		while i < @segment.length - 3
+			if @segment[i+1] - @segment[i] != 1 || @segment[i+2] - @segment[i+1] != 1
+				i += 1
+				next
+			end
+			@segment.delete_at i+1
+			@cut.delete_at i+1
+			@lengths_before_pivot[i] += @lengths_before_pivot[i+1]
+			@lengths_before_pivot.delete_at i+1
+			i += 1
+		end
+		self
+	end
+end
+
+class WorseBlockSegmentation < Exception
+end
+
+class OptimalBlockSegmentationsAtPivot
+	attr_reader :segmentations
+
+	def initialize segmentation
+		@best_lengths = segmentation.lengths_before_pivot.dup
+		@segmentations = Set[segmentation]
+		segmentation.optimal_collections.add self
+	end
+
+	def update segmentation
+		case segmentation.lengths_before_pivot <=> @best_lengths
+		when 1 # new segmentation is better
+			@best_lengths = segmentation.lengths_before_pivot.dup
+			@segmentations.replace [segmentation]
+			segmentation.optimal_collections.add self
+		when 0 # new segmentation is equally good
+			add segmentation
+		when -1 # new segmentation is worse
+			raise WorseBlockSegmentation # raise exception to skip further processing of this segmentation
+		end
+	end
+
+	def add segmentation
+		@segmentations.add segmentation
+		segmentation.optimal_collections.add self
+	end
+
+	def purge_unreachable earliest_start
+		@segmentations.delete_if do |segmentation|
+			segmentation.optimal_collections.delete self if segmentation.next_start < earliest_start
+		end
+	end
+
+	def purge_nonoptimal
+		@segmentations.delete_if do |segmentation|
+			segmentation.optimal_collections.delete self if segmentation.nonoptimal
+		end
+	end
+end
 
 input_file = ARGV[0] || '/dev/stdin'
 output_file = ARGV[1] || '/dev/stdout'
-input_chart = JSON.parse File.read input_file
-input_events = input_chart['events']
-input_events.each { |event| event['tick'] = (event['time'] * 1000).round }
-input_notes = input_events.filter { |event| %w[tap drag hold flick].include? event['type'] }
-input_notes.sort_by! { |event| event['tick'] }
+input_chart = JSON.parse File.read(input_file), symbolize_names: true
+notes = Note.notes_from_events input_chart[:events]
 
-event_order_list = []
-tempo_list = []
-note_list = []
-page_list = []
-
-# Group notes by their y position.
-# Discard notes if more than two distinc y positions are present.
-# Returns an array of at most length 2, with each element being an array of notes with the same y position.
-# The input array will be modified (with elements deleted and reordered).
-def organize_simutaneous_notes notes, last_y = 0
-	notes.sort_by! { |note| (note['properties']['y'] - last_y).abs }
-	notes_grouped_by_y = notes.group_by { |note| note['properties']['y'] }
-	if notes_grouped_by_y.size > 2
-		warn "Warning: Some notes are discarded."
-		notes_grouped_by_y.slice! ..2
-		notes.replace notes_grouped_by_y.inject([]) { _1 + _2 }
-	end
-	notes_grouped_by_y.values
-end
-
-# Handle the first page and the first notes
-input_notes_grouped_by_tick = input_notes.group_by { |event| event['tick'] }
-notes = input_notes_grouped_by_tick.values.first
-notes_grouped_by_y = organize_simutaneous_notes notes
-page_list.push({
-	start_tick: 0,
-	end_tick: notes.first['tick'],
-	scan_line_direction: notes.first['properties']['y'] >= 0 ? 1 : -1,
-	PositionFunction: {Type: 0, Arguments: [0.0, notes.first['properties']['y'] / 50.0]}
-})
-notes_grouped_by_y.each_with_index do |notes_with_same_y, i|
-	notes_with_same_y.each do |note|
-		note_list.push(note['out'] = {
-			page_index: i,
-			type: {tap: 0, hold: 2, drag: 3, flick: 5}[note['type'].to_sym], # change later
-			id: note_list.length,
-			tick: note['tick'],
-			x: (note['properties']['x'] + 100) / 200.0,
-			has_sibling: notes.length > 1,
-			hold_tick: note['type'] == 'hold' ? (note['properties']['duration'] * 1000).round : 0,
-			next_id: note['type'] == 'drag' ? -1 : 0, # change later
-			is_forward: false,
-			NoteDirection: 0
-		})
-	end
-end
-
-input_notes_grouped_by_tick.each_cons 2 do |(last_tick, last_notes), (tick, notes)|
-	notes_grouped_by_y = organize_simutaneous_notes notes, last_notes.last['properties']['y']
-
-	# Add page
-	y1 = last_notes.last['properties']['y']
-	y2 = notes.first['properties']['y']
-	page_list.push({
-		start_tick: last_tick,
-		end_tick: tick,
-		scan_line_direction: y2 - y1 >= 0 ? 1 : -1, # 1 up, -1 down
-		PositionFunction: {
-			Type: 0,
-			# 1st arg: amplitude, 1.0 for full height
-			# 2nd arg: center position, -1.0 for bottom, 1.0 for top
-			Arguments: [(y2 - y1).abs / 100.0, (y2 + y1) / 100.0]
-		}
-	})
-
-	# Add notes
-	notes_grouped_by_y.each_with_index do |notes_with_same_y, i|
-		notes_with_same_y.each do |note|
-			note_list.push(note['out'] = {
-				page_index: page_list.length - 1 + i,
-				type: {tap: 0, hold: 2, drag: 3, flick: 5}[note['type'].to_sym], # change later
-				id: note_list.length,
-				tick: tick,
-				x: (note['properties']['x'] + 100) / 200.0,
-				has_sibling: notes.length > 1,
-				hold_tick: note['type'] == 'hold' ? (note['properties']['duration'] * 1000).round : 0,
-				next_id: note['type'] == 'drag' ? -1 : 0, # change later
-				is_forward: false,
-				NoteDirection: 0
-			})
-		end
-	end
-end
-
-# Handle the last page
-note = input_notes_grouped_by_tick.values.last.last
-page_list.push({
-	start_tick: note['tick'],
-	end_tick: note['tick'] + 1,
-	scan_line_direction: 1,
-	PositionFunction: {
-		Type: 0,
-		Arguments: [0.0, note['properties']['y'] / 50.0]
-	}
-})
-
-# Connect chains
-input_notes.group_by { |note| note['properties']['tipPoint'] }.each do |tip_point_id, notes|
-	next unless tip_point_id
-	notes.each_cons 2 do |note1, note2|
-		type1 = note1['type']
-		output_note1 = note1['out']
-		output_note2 = note2['out']
-		type2 = note2['type']
-		if type1 == 'tap' && type2 == 'drag'
-			output_note1[:next_id] = output_note2[:id]
-			output_note1[:type] = 6 # click drag
-			output_note2[:type] = 7 # click drag child
-		elsif output_note1[:type] == 7 && type2 == 'drag'
-			output_note1[:next_id] = output_note2[:id]
-			output_note2[:type] = 7 # click drag child
-		elsif [3, 4].include?(output_note1[:type]) && type2 == 'drag'
-			output_note1[:next_id] = output_note2[:id]
-			output_note2[:type] = 4 # drag child
-		end
-	end
-end
-
-# Big texts
-input_events.each do |event|
-	next if event['type'] != 'bigText'
-	event_order_list.push({
-		tick: event['tick'],
-		event_list: [{
-			type: 8, # custom texts
-			args: "#{event['properties']['text'].tr ?,, ?\s},#FFFFFF" # white text, cannot contain comma
-		}]
-	})
-end
-
-File.write output_file, JSON.generate({
-	format_version: 1,
-	time_base: 480,
-	start_offset_time: 0.0,
-	end_offset_time: 0.0,
-	is_start_without_ui: false,
-	page_list: page_list,
-	tempo_list: [{tick: 0, value: 480000}], # one millisecond per tick
-	event_order_list: event_order_list,
-	note_list: note_list
-})
+File.write output_file, JSON.pretty_generate(Chart.new(notes).to_cytus)
